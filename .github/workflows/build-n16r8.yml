@@ -179,6 +179,19 @@ jobs:
           fi
           echo "Bootloader found at $BOOTLOADER_PATH"
 
+      - name: Confirm watchdog config
+        run: |
+          # fail loudly if the watchdogs did not survive Kconfig resolution --
+          # this build exists to turn silent lockups into recorded panics.
+          echo "Resolved watchdog config (build/config/sdkconfig):"
+          grep -E "CONFIG_ESP_INT_WDT|CONFIG_ESP_TASK_WDT" build/config/sdkconfig
+          grep -q "^CONFIG_ESP_TASK_WDT_EN=y$" build/config/sdkconfig \
+            || { echo "ERROR: CONFIG_ESP_TASK_WDT_EN is not enabled"; exit 1; }
+          grep -q "^CONFIG_ESP_INT_WDT=y$" build/config/sdkconfig \
+            || { echo "ERROR: CONFIG_ESP_INT_WDT is not enabled"; exit 1; }
+          grep -q "^CONFIG_ESP_TASK_WDT_PANIC=y$" build/config/sdkconfig \
+            || { echo "ERROR: CONFIG_ESP_TASK_WDT_PANIC is not enabled"; exit 1; }
+
       - name: Check OTA Slot Size
         if: matrix.target.ota == true
         run: |
