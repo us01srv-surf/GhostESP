@@ -183,14 +183,22 @@ jobs:
         run: |
           # fail loudly if the watchdogs did not survive Kconfig resolution --
           # this build exists to turn silent lockups into recorded panics.
-          echo "Resolved watchdog config (build/config/sdkconfig):"
-          grep -E "CONFIG_ESP_INT_WDT|CONFIG_ESP_TASK_WDT" build/config/sdkconfig
-          grep -q "^CONFIG_ESP_TASK_WDT_EN=y$" build/config/sdkconfig \
+          echo "Resolved watchdog config (sdkconfig):"
+          grep -E "CONFIG_ESP_INT_WDT|CONFIG_ESP_TASK_WDT" sdkconfig
+          echo "Compiled-in values (build/config/sdkconfig.h):"
+          grep -E "#define CONFIG_ESP_INT_WDT |#define CONFIG_ESP_TASK_WDT_EN |#define CONFIG_ESP_TASK_WDT_PANIC " build/config/sdkconfig.h
+          grep -q "^CONFIG_ESP_TASK_WDT_EN=y$" sdkconfig \
             || { echo "ERROR: CONFIG_ESP_TASK_WDT_EN is not enabled"; exit 1; }
-          grep -q "^CONFIG_ESP_INT_WDT=y$" build/config/sdkconfig \
+          grep -q "^CONFIG_ESP_INT_WDT=y$" sdkconfig \
             || { echo "ERROR: CONFIG_ESP_INT_WDT is not enabled"; exit 1; }
-          grep -q "^CONFIG_ESP_TASK_WDT_PANIC=y$" build/config/sdkconfig \
+          grep -q "^CONFIG_ESP_TASK_WDT_PANIC=y$" sdkconfig \
             || { echo "ERROR: CONFIG_ESP_TASK_WDT_PANIC is not enabled"; exit 1; }
+          grep -q "^#define CONFIG_ESP_TASK_WDT_EN 1$" build/config/sdkconfig.h \
+            || { echo "ERROR: CONFIG_ESP_TASK_WDT_EN not compiled in"; exit 1; }
+          grep -q "^#define CONFIG_ESP_INT_WDT 1$" build/config/sdkconfig.h \
+            || { echo "ERROR: CONFIG_ESP_INT_WDT not compiled in"; exit 1; }
+          grep -q "^#define CONFIG_ESP_TASK_WDT_PANIC 1$" build/config/sdkconfig.h \
+            || { echo "ERROR: CONFIG_ESP_TASK_WDT_PANIC not compiled in"; exit 1; }
 
       - name: Check OTA Slot Size
         if: matrix.target.ota == true
