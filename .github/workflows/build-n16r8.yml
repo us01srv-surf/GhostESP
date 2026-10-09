@@ -1,0 +1,282 @@
+name: Build n16r8 (ESP32-S3 N16R8)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build:
+    name: Build for ${{ matrix.target.name }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        target:
+          - { name: "n16r8", idf_target: "esp32s3", sdkconfig_file: "configs/sdkconfig.n16r8", zip_name: "esp32s3-n16r8.zip", ota: true }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - uses: actions/cache@v4
+        id: cache-idf
+        with:
+          path: |
+            ~/esp-idf
+            ~/.espressif
+          key: esp-idf-v6.1-${{ runner.os }}-v1
+
+      - name: Install ESP-IDF Dependencies
+        if: steps.cache-idf.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget git flex bison gperf python3-pip python3-setuptools cmake ninja-build ccache libffi-dev libssl-dev dfu-util
+
+      - name: Install ESP-IDF
+        if: steps.cache-idf.outputs.cache-hit != 'true'
+        run: |
+          git clone -b v6.1 --depth 1 --recursive https://github.com/espressif/esp-idf.git ~/esp-idf
+          ~/esp-idf/install.sh
+
+      - name: Repair cached ESP-IDF Python environment if broken
+        if: steps.cache-idf.outputs.cache-hit == 'true'
+        run: |
+          # The cached venv's bin/python symlinks into the runner's Python
+          # toolcache (/opt/hostedtoolcache/Python/3.10.x/...). GitHub bumps
+          # the patch version on image updates, evicting the old path and
+          # breaking the symlink -- export.sh then fails with "virtual
+          # environment not found". Detect that and rebuild just the venv;
+          # the toolchains under ~/.espressif/tools stay cached, so this is
+          # fast (only pip installs the requirements).
+          # Derive the venv name the same way ESP-IDF does (idf_tools.py):
+          # idf{MAJOR.MINOR}_py{PY_MAJOR.MINOR}_env. Note: there is no
+          # version.txt at the repo root -- the version comes from the
+          # esp_idf_version.h header.
+          IDF_VER=$(sed -nE 's/^#define ESP_IDF_VERSION_(MAJOR|MINOR) +([0-9]+)/\2/p' \
+            ~/esp-idf/components/esp_common/include/esp_idf_version.h | paste -sd.)
+          PY_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+          VENV="$HOME/.espressif/python_env/idf${IDF_VER}_py${PY_VER}_env"
+          if [ -x "$VENV/bin/python" ]; then
+            echo "ESP-IDF Python env is usable: $VENV"
+          else
+            echo "Cached ESP-IDF Python env ($VENV) is missing or broken; recreating..."
+            rm -rf "$VENV"
+            ~/esp-idf/install.sh
+          fi
+
+      - name: Apply Custom SDK Config
+        run: |
+          rm -f sdkconfig sdkconfig.defaults
+          cp "${{ matrix.target.sdkconfig_file }}" sdkconfig.defaults
+          cp "${{ matrix.target.sdkconfig_file }}" sdkconfig
+          printf "\n# CONFIG_FATFS_USE_DYN_BUFFERS is not set\n" >> sdkconfig.defaults
+          printf "\n# CONFIG_FATFS_USE_DYN_BUFFERS is not set\n" >> sdkconfig
+          printf "\n# CONFIG_ESP_GDBSTUB_ENABLED is not set\n" >> sdkconfig.defaults
+          printf "\n# CONFIG_ESP_GDBSTUB_ENABLED is not set\n" >> sdkconfig
+
+      - name: Set up ESP-IDF Environment
+        run: |
+          . ~/esp-idf/export.sh
+          export IDF_TARGET=${{ matrix.target.idf_target }}
+          echo "IDF_TARGET=${{ matrix.target.idf_target }}" >> $GITHUB_ENV
+
+      - name: Preserve custom Wi-Fi cache buffer count on ESP-IDF 6.1
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          defaults = Path("sdkconfig.defaults").read_text(encoding="utf-8")
+          match = re.search(r"^CONFIG_ESP_WIFI_CACHE_TX_BUFFER_NUM=(\d+)\s*$", defaults, re.MULTILINE)
+          if not match or match.group(1) == "32":
+              raise SystemExit(0)
+          value = match.group(1)
+          kconfig = Path.home() / "esp-idf/components/esp_wifi/Kconfig"
+          source = kconfig.read_text(encoding="utf-8")
+          pattern = re.compile(
+              r"(config ESP_WIFI_CACHE_TX_BUFFER_NUM\n"
+              r"(?:(?!\n\s*config ).)*?\n\s*default )32(\n)",
+              re.DOTALL,
+          )
+          source, count = pattern.subn(
+              rf"\g<1>{value}\g<2>",
+              source,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit("ESP-IDF Wi-Fi cache buffer Kconfig layout changed")
+          kconfig.write_text(source, encoding="utf-8")
+          PY
+
+      - name: Patch ESP-IDF gdbstub compatibility
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          import re
+
+          idf = Path.home() / "esp-idf"
+
+          gdbstub = idf / "components/esp_gdbstub/src/gdbstub.c"
+          source = gdbstub.read_text(encoding="utf-8")
+          helper_guard = re.compile(
+              r"#if\s*\(?\s*CONFIG_ESP_SYSTEM_GDBSTUB_RUNTIME\s*\|\|\s*CONFIG_ESP_GDBSTUB_SUPPORT_TASKS\s*\)?"
+          )
+          if helper_guard.search(source):
+              source = helper_guard.sub("#if 1", source)
+              gdbstub.write_text(source, encoding="utf-8")
+
+          if os.environ["IDF_TARGET"] in {"esp32", "esp32s2", "esp32s3"}:
+              xtensa = idf / "components/esp_gdbstub/src/port/xtensa/gdbstub_xtensa.c"
+              source = xtensa.read_text(encoding="utf-8")
+              source = source.replace("portNUM_PROCESSORS", "CONFIG_FREERTOS_NUMBER_OF_CORES")
+              source, tcb_count = re.subn(
+                  r"const\s+StaticTask_t\s*\*\s*tcb\s*;",
+                  "void *tcb = NULL;",
+                  source,
+              )
+              source, lookup_count = re.subn(
+                  r"tcb\s*=\s*esp_gdbstub_find_tcb_by_frame\s*\(frame\)\s*;",
+                  "",
+                  source,
+              )
+              source, call_count = re.subn(
+                  r"#if\s+(?:XCHAL_HAVE_FP|0)\s+(?=gdbstub_write_fpu_regs\s*\()",
+                  "#if 0\n    ",
+                  source,
+              )
+              if tcb_count != lookup_count or tcb_count not in {0, 1}:
+                  raise SystemExit(
+                      f"unexpected Xtensa FPU patch counts: tcb={tcb_count}, lookup={lookup_count}"
+                  )
+              xtensa.write_text(source, encoding="utf-8")
+          PY
+
+      - name: Clean and Build Project
+        env:
+          SDKCONFIG_DEFAULTS: "sdkconfig.defaults"
+        run: |
+          . ~/esp-idf/export.sh
+          export CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)
+          idf.py clean
+          idf.py build || {
+            echo "Build failed for ${{ matrix.target.name }}"
+            exit 1
+          }
+
+      - name: Verify Bootloader Exists
+        run: |
+          BOOTLOADER_PATH="build/bootloader/bootloader.bin"
+          if [ ! -f "$BOOTLOADER_PATH" ]; then
+            echo "Error: Bootloader not found at $BOOTLOADER_PATH"
+            exit 1
+          fi
+          echo "Bootloader found at $BOOTLOADER_PATH"
+
+      - name: Check OTA Slot Size
+        if: matrix.target.ota == true
+        run: |
+          # the slot budget is read from the partition table this build
+          # produced. it used to be an ota_slot_size field in the matrix above,
+          # which had drifted by 128KB on seven boards.
+          python3 scripts/partition_table.py check-fit \
+            build/Ghost_ESP_IDF.bin build/partition_table/partition-table.bin
+
+      - name: Note unpublished A/B boards
+        run: |
+          # advisory only. publishing ota for a board is a support commitment,
+          # so it stays a deliberate `ota: true` in the matrix; this just makes
+          # it visible when someone adds ota_0/ota_1 and forgets the follow-up.
+          python3 scripts/partition_table.py ota-warning \
+            build/partition_table/partition-table.bin \
+            --name "${{ matrix.target.name }}"
+
+      - name: Package Artifacts into ZIP
+        run: |
+          . ~/esp-idf/export.sh
+          ARTIFACT_DIR="packaged_artifacts_${{ matrix.target.name }}"
+          ZIP_FILE="${{ matrix.target.zip_name }}"
+          ELF_FILE="${ZIP_FILE%.zip}.elf"
+          mkdir -p "$ARTIFACT_DIR"
+          cp build/partition_table/partition-table.bin "$ARTIFACT_DIR/partitions.bin" || { echo "Failed to copy partition table"; exit 1; }
+          cp build/bootloader/bootloader.bin "$ARTIFACT_DIR/bootloader.bin" || { echo "Failed to copy bootloader"; exit 1; }
+          cp build/Ghost_ESP_IDF.bin "$ARTIFACT_DIR/firmware.bin" || { echo "Failed to copy app binary"; exit 1; }
+          IDF_TARGET="${{ matrix.target.idf_target }}"
+          if [ "$IDF_TARGET" != "esp32p4" ] && [ -f build/Ghost_ESP_IDF.elf ]; then
+            cp build/Ghost_ESP_IDF.elf "$ARTIFACT_DIR/$ELF_FILE" || { echo "Failed to copy app elf"; exit 1; }
+          fi
+          # Source flash mode/freq/size from the resolved build config so
+          # merge_bin's header re-stamp exactly matches what the binaries were
+          # compiled with. merge_bin does NOT recompute each image's SHA-256, so
+          # any mismatch here breaks the bootloader's per-boot image check (and a
+          # too-small size also makes partitions past that size unreachable).
+          get_cfg() { sed -nE "s/^#define $1 \"([^\"]*)\"/\1/p" build/config/sdkconfig.h; }
+          FLASH_MODE=$(get_cfg CONFIG_ESPTOOLPY_FLASHMODE)
+          FLASH_FREQ=$(get_cfg CONFIG_ESPTOOLPY_FLASHFREQ)
+          FLASH_SIZE=$(get_cfg CONFIG_ESPTOOLPY_FLASHSIZE)
+          FLASH_MODE=${FLASH_MODE:-dio}
+          FLASH_FREQ=${FLASH_FREQ:-40m}
+          FLASH_SIZE=${FLASH_SIZE:-4MB}
+          # offsets come from the partition table this build produced. the app
+          # offset is not always 0x10000: the ota tables put otadata there and
+          # the first app slot at 0x20000 or above, so a hardcoded offset
+          # writes the app over otadata and leaves every app slot empty. the
+          # bootloader offset is the one value that cannot be derived, so it
+          # lives in scripts/partition_table.py, which build.py also uses.
+          BOOT_OFFSET=$(python3 scripts/partition_table.py bootloader-offset "$IDF_TARGET")
+          APP_OFFSET=$(python3 scripts/partition_table.py offset "$ARTIFACT_DIR/partitions.bin") \
+            || { echo "Failed to read app offset from partition table"; exit 1; }
+          echo "Bootloader offset for ${{ matrix.target.name }}: $BOOT_OFFSET"
+          echo "App offset for ${{ matrix.target.name }}: $APP_OFFSET"
+
+          if [ "$IDF_TARGET" = "esp32p4" ]; then
+            SLAVE_OFFSET=$(python3 scripts/partition_table.py label-offset \
+              "$ARTIFACT_DIR/partitions.bin" slave_fw) \
+              || { echo "Failed to read slave_fw offset from partition table"; exit 1; }
+            echo "C6 payload offset for ${{ matrix.target.name }}: $SLAVE_OFFSET"
+            cp "$ARTIFACT_DIR/firmware.bin" "$ARTIFACT_DIR/p4-app.bin"
+            python3 - "$APP_OFFSET" "$SLAVE_OFFSET" \
+              "$ARTIFACT_DIR/p4-app.bin" firmware/crowpanel_p4/network_adapter.bin \
+              "$ARTIFACT_DIR/firmware.bin" <<'PY'
+          import pathlib, sys
+          app_offset = int(sys.argv[1], 0)
+          slave_offset = int(sys.argv[2], 0)
+          app = pathlib.Path(sys.argv[3]).read_bytes()
+          slave = pathlib.Path(sys.argv[4]).read_bytes()
+          output = pathlib.Path(sys.argv[5])
+          relative_slave = slave_offset - app_offset
+          if relative_slave < len(app):
+              raise SystemExit("P4 app overlaps slave_fw partition")
+          image = bytearray(b"\xff" * (relative_slave + len(slave)))
+          image[:len(app)] = app
+          image[relative_slave:relative_slave + len(slave)] = slave
+          output.write_bytes(image)
+          print(f"Created three-file P4 factory bundle: {len(image)} bytes")
+          PY
+            rm "$ARTIFACT_DIR/p4-app.bin"
+          else
+            python3 -m esptool --chip "$IDF_TARGET" merge_bin \
+              --output "$ARTIFACT_DIR/merged.bin" \
+              --flash_mode "$FLASH_MODE" \
+              --flash_freq "$FLASH_FREQ" \
+              --flash_size "$FLASH_SIZE" \
+              --target-offset 0x0 \
+              "$BOOT_OFFSET" "$ARTIFACT_DIR/bootloader.bin" \
+              0x8000 "$ARTIFACT_DIR/partitions.bin" \
+              "$APP_OFFSET" "$ARTIFACT_DIR/firmware.bin" \
+              || { echo "Failed to create merged binary"; exit 1; }
+          fi
+
+          zip -j "$ZIP_FILE" "$ARTIFACT_DIR"/* || { echo "Failed to create ZIP $ZIP_FILE"; exit 1; }
+          ls -lh "$ZIP_FILE"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: artifact-${{ matrix.target.zip_name }}
+          path: ${{ matrix.target.zip_name }}
