@@ -1586,6 +1586,12 @@ void esp_comm_manager_init(gpio_num_t tx_pin, gpio_num_t rx_pin, uint32_t baud_r
     uart_param_config(s_uart_num, &uart_config);
     uart_set_pin(s_uart_num, resolved_tx, resolved_rx, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 
+    // GPIO7 RX may float with nothing attached; enable the internal pull-up so
+    // line noise cannot drive the peer-protocol state machine.
+    if (resolved_rx >= 0) {
+        gpio_set_pull_mode(resolved_rx, GPIO_PULLUP_ONLY);
+    }
+
     s_comm_manager->tx_queue = NULL;
     s_comm_manager->rx_packet_queue = NULL;
     s_comm_manager->command_queue = NULL;

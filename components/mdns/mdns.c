@@ -65,6 +65,13 @@ static const char *TAG = "mdns";
 static volatile TaskHandle_t _mdns_service_task_handle = NULL;
 static SemaphoreHandle_t _mdns_service_semaphore = NULL;
 
+/* Lightweight diagnostics: rate-limited activity counters (mdns diag log) */
+static uint32_t s_diag_rx_enq;        /* RX actions successfully enqueued      */
+static uint32_t s_diag_rx_drop;       /* RX enqueues rejected (queue full)     */
+static uint32_t s_diag_tx_enq;        /* TX actions successfully enqueued      */
+static uint32_t s_diag_actions;       /* actions executed by service task      */
+static TickType_t s_diag_last_log;    /* tick of last diag log line            */
+
 static void _mdns_search_finish_done(void);
 static mdns_search_once_t *_mdns_search_find_from(mdns_search_once_t *search, mdns_name_t *name, uint16_t type, mdns_if_t tcpip_if, mdns_ip_protocol_t ip_protocol);
 static mdns_browse_t *_mdns_browse_find_from(mdns_browse_t *b, mdns_name_t *name, uint16_t type, mdns_if_t tcpip_if, mdns_ip_protocol_t ip_protocol);
@@ -367,8 +374,10 @@ esp_err_t _mdns_send_rx_action(mdns_rx_packet_t *packet)
     action->data.rx_handle.packet = packet;
     if (xQueueSend(_mdns_server->action_queue, &action, (TickType_t)0) != pdPASS) {
         free(action);
+        s_diag_rx_drop++;
         return ESP_ERR_NO_MEM;
     }
+    s_diag_rx_enq++;
     return ESP_OK;
 }
 
@@ -5294,6 +5303,8 @@ static void _mdns_scheduler_run(void)
             if (xQueueSend(_mdns_server->action_queue, &action, (TickType_t)0) != pdPASS) {
                 free(action);
                 p->queued = false;
+            } else {
+                s_diag_tx_enq++;
             }
         } else {
             HOOK_MALLOC_FAILED;
@@ -5343,15 +5354,41 @@ static void _mdns_search_run(void)
 static void _mdns_service_task(void *pvParameters)
 {
     mdns_action_t *a = NULL;
+    uint8_t since_yield = 0;
     for (;;) {
         if (_mdns_server && _mdns_server->action_queue) {
-            if (xQueueReceive(_mdns_server->action_queue, &a, portMAX_DELAY) == pdTRUE) {
+            /* Timed receive (1s) so the loop can wake for periodic diagnostics
+             * instead of blocking forever on an empty queue. */
+            if (xQueueReceive(_mdns_server->action_queue, &a, 1000 * portTICK_PERIOD_MS) == pdTRUE) {
                 if (a && a->type == ACTION_TASK_STOP) {
                     break;
                 }
                 MDNS_SERVICE_LOCK();
                 _mdns_execute_action(a);
                 MDNS_SERVICE_UNLOCK();
+                s_diag_actions++;
+                /* Convoy backstop: never process the queue back-to-back for too
+                 * long without yielding, or IDLE never runs and TWDT fires. */
+                if (++since_yield >= 8) {
+                    since_yield = 0;
+                    vTaskDelay(1);
+                }
+            }
+            /* Rate-limited diagnostics: at most one line per second, only when
+             * activity was observed since the previous log. */
+            TickType_t now = xTaskGetTickCount();
+            if ((now - s_diag_last_log) >= (1000 / portTICK_PERIOD_MS)) {
+                uint32_t rx_enq = s_diag_rx_enq;
+                uint32_t rx_drop = s_diag_rx_drop;
+                uint32_t tx_enq = s_diag_tx_enq;
+                uint32_t actions = s_diag_actions;
+                if (rx_enq || rx_drop || tx_enq || actions) {
+                    s_diag_rx_enq = s_diag_rx_drop = s_diag_tx_enq = s_diag_actions = 0;
+                    ESP_LOGW(TAG, "mdns diag: actions=%u rx_enq=%u rx_drop=%u tx_enq=%u qdepth=%u",
+                             (unsigned)actions, (unsigned)rx_enq, (unsigned)rx_drop, (unsigned)tx_enq,
+                             (unsigned)uxQueueMessagesWaiting(_mdns_server->action_queue));
+                }
+                s_diag_last_log = now;
             }
         } else {
             vTaskDelay(500 * portTICK_PERIOD_MS);
@@ -6152,7 +6189,8 @@ esp_err_t mdns_service_txt_set_for_host(const char *instance, const char *servic
     if (num_items) {
         new_txt = _mdns_allocate_txt(num_items, txt_items);
         if (!new_txt) {
-            return ESP_ERR_NO_MEM;
+            ret = ESP_ERR_NO_MEM;
+            goto err;
         }
     }
     mdns_service_t *srv = s->service;
