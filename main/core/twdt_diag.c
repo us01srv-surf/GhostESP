@@ -24,6 +24,14 @@
 #include "esp_log.h"
 #include "esp_rom_sys.h"  /* esp_rom_printf: lock-free console write, safe in abort context */
 #include "esp_system.h"   /* esp_register_shutdown_handler */
+#include "esp_intr_alloc.h" /* esp_intr_dump (abort-context last resort) */
+#if CONFIG_IDF_TARGET_ESP32S3
+#include "soc/soc.h"           /* REG_READ, DR_REG_*_BASE */
+#include "soc/interrupt_reg.h" /* -> soc/interrupt_core0_reg.h: INTR_STATUS_0..3 */
+#include "soc/bb_reg.h"        /* BBPD_CTRL  (WiFi BB power ctrl)  */
+#include "soc/nrx_reg.h"       /* NRXPD_CTRL (WiFi RX power ctrl)  */
+#include "soc/fe_reg.h"        /* FE_GEN_CTRL (RF front-end ctrl)  */
+#endif
 #if CONFIG_ESP_TASK_WDT_EN
 #include "esp_task_wdt.h" /* esp_task_wdt_isr_user_handler (weak; we override it) */
 #endif
@@ -292,6 +300,54 @@ static uint64_t td_dump_delta_by_name(const TaskStatus_t *cur, UBaseType_t n, co
     return acc;
 }
 
+#if CONFIG_IDF_TARGET_ESP32S3
+/* ------------------------------------------------------------------ */
+/* Interrupt-controller + WiFi-domain attribution snapshot (round 6).  */
+/*                                                                      */
+/* All accesses read-only, safe from the TWDT abort ISR. Register names */
+/* come from the v6.1 SoC headers:                                     */
+/*   soc/interrupt_core0_reg.h : INTERRUPT_CORE0_INTR_STATUS_0..3 (RO, */
+/*                               base+0x18C..0x198, pending status of  */
+/*                               the mapped peripheral sources; IST    */
+/*                               bit N == periph_interrupt_t source N) */
+/*   soc/bb_reg.h              : BBPD_CTRL  (WiFi BB power control)    */
+/*   soc/nrx_reg.h             : NRXPD_CTRL (WiFi RX power control)    */
+/*   soc/fe_reg.h              : FE_GEN_CTRL (RF front-end control)    */
+/* NOTE: the ESP32-S3 interrupt core has NO                       */
+/* INTERRUPT_CORE0_CPU_INT_ENABLE_REG / CPU_INT_THRESH_REG (those      */
+/* exist on the RISC-V interrupt core, e.g. esp32c3); on Xtensa the    */
+/* CPU-side enable mask is the INTENABLE special register and the      */
+/* pending mask is INTERRUPT, read here via RSR. #ifdef below keeps    */
+/* the MMIO variant if a future header provides it.                    */
+/* ------------------------------------------------------------------ */
+static void td_dump_intc(void)
+{
+#ifdef INTERRUPT_CORE0_CPU_INT_ENABLE_REG
+    const uint32_t ien = (uint32_t)REG_READ(INTERRUPT_CORE0_CPU_INT_ENABLE_REG);
+#else
+    uint32_t ien;
+    __asm__ __volatile__("rsr %0, INTENABLE" : "=r"(ien));
+#endif
+    uint32_t ipend;
+    __asm__ __volatile__("rsr %0, INTERRUPT" : "=r"(ipend));
+
+    const uint32_t ist0 = (uint32_t)REG_READ(INTERRUPT_CORE0_INTR_STATUS_0_REG);
+    const uint32_t ist1 = (uint32_t)REG_READ(INTERRUPT_CORE0_INTR_STATUS_1_REG);
+    const uint32_t ist2 = (uint32_t)REG_READ(INTERRUPT_CORE0_INTR_STATUS_2_REG);
+    const uint32_t ist3 = (uint32_t)REG_READ(INTERRUPT_CORE0_INTR_STATUS_3_REG);
+
+    esp_rom_printf("IEN=0x%08x IPEND=0x%08x\r\n", ien, ipend);
+    esp_rom_printf("IST=0x%08x/0x%08x/0x%08x/0x%08x\r\n", ist0, ist1, ist2, ist3);
+    /* Static legend so a stuck bit is nameable without the headers:
+     * IST bit positions = periph_interrupt_t source numbers
+     * (soc/interrupts.h); CPU-int reservations from
+     * esp_hw_support/port/esp32s3/esp_cpu_intr.c. */
+    esp_rom_printf("IENLEG: IST b0=WMAC b1=WMAC_NMI b2=WPWR b3=WBB b8=RWBLE "
+                   "b12=SLC0 b13=SLC1 b49=TG0_WDT b53=SYSTIMER; "
+                   "IPEND b0=WMAC b4=WBB b14=NMI b24=T1WDT b28=IPC\r\n");
+}
+#endif /* CONFIG_IDF_TARGET_ESP32S3 */
+
 static void td_panic_dump(void)
 {
     if (s_init_wall0 == 0 || s_dumped) {
@@ -309,8 +365,25 @@ static void td_panic_dump(void)
         (now > s_init_wall0) ? (uint64_t)(now - s_init_wall0) : 0u;
 
     uint64_t sum = 0;
+    /* Top-3 CPU-time consumers by delta (attribution when a task is not one
+     * of the named fields below). Updated in the same single pass. */
+    const char *top_name[3] = { "-", "-", "-" };
+    uint64_t    top_ms[3]   = { 0, 0, 0 };
     for (UBaseType_t i = 0; i < n; i++) {
-        sum += td_dump_delta(&s_dump[i]);
+        const uint64_t d = td_dump_delta(&s_dump[i]);
+        sum += d;
+        const uint64_t dm = d / 1000u;
+        for (int t = 0; t < 3; t++) {
+            if (dm > top_ms[t]) {
+                for (int u = 2; u > t; u--) {
+                    top_ms[u]   = top_ms[u - 1];
+                    top_name[u] = top_name[u - 1];
+                }
+                top_ms[t]   = dm;
+                top_name[t] = (s_dump[i].pcTaskName != NULL) ? s_dump[i].pcTaskName : "?";
+                break;
+            }
+        }
     }
 
     /* All values reported in milliseconds (run-time counters are us). */
@@ -320,11 +393,11 @@ static void td_panic_dump(void)
     const uint64_t wall2 = wall * 2u;
     const uint64_t isr2 = (wall2 > sum_ms) ? (wall2 - sum_ms) : 0u;
 
-    static char s_line[320];   /* static: abort context, never stack */
+    static char s_line[384];   /* static: abort context, never stack */
     snprintf(s_line, sizeof(s_line),
              "TWDUMP seq=%u cbs=%u lastcb=%ums wall=%ums sum=%ums isr~=%ums isr2~=%ums "
              "idle=%ums wifi=%ums tcpip=%ums main=%ums mdns=%ums tmr=%ums idle1=%ums "
-             "sys_evt=%ums bt=%ums",
+             "sys_evt=%ums bt=%ums top1=%s:%ums top2=%s:%ums top3=%s:%ums",
              (unsigned)s_seq, (unsigned)s_cb_count, (unsigned)s_last_cb_rel_ms,
              (unsigned)wall, (unsigned)sum_ms, (unsigned)isr, (unsigned)isr2,
              (unsigned)(td_dump_delta_by_name(s_dump, n, "IDLE") / 1000u),
@@ -335,13 +408,36 @@ static void td_panic_dump(void)
              (unsigned)(td_dump_delta_by_name(s_dump, n, "esp_timer") / 1000u),
              (unsigned)(td_dump_delta_by_name(s_dump, n, "IDLE1") / 1000u),
              (unsigned)(td_dump_delta_by_name(s_dump, n, "sys_evt") / 1000u),
-             (unsigned)(td_dump_delta_by_name(s_dump, n, "bt") / 1000u));
+             (unsigned)(td_dump_delta_by_name(s_dump, n, "bt") / 1000u),
+             top_name[0], (unsigned)top_ms[0],
+             top_name[1], (unsigned)top_ms[1],
+             top_name[2], (unsigned)top_ms[2]);
 
     /* Panic-safe path first: ROM console, no lock, no malloc. */
     esp_rom_printf("%s\r\n", s_line);
     /* Belt-and-braces: also via the logger (may be dropped if its mutex is
      * held by the task the watchdog is aborting - that is fine). */
     esp_log_write(ESP_LOG_ERROR, "TWDIAG", "%s\r\n", s_line);
+
+#if CONFIG_IDF_TARGET_ESP32S3
+    /* Interrupt-controller + WiFi-domain registers: which CPU interrupt is
+     * pending/stuck and which peripheral sources are asserting. */
+    td_dump_intc();
+    /* Public WiFi power/ctrl regs (soc/bb_reg.h, nrx_reg.h, fe_reg.h):
+     * values show BB/RX/FE block power-state force bits if the MAC is wedged. */
+    esp_rom_printf("WRF BBPD=0x%08x NRXPD=0x%08x FEGC=0x%08x\r\n",
+                   (unsigned)REG_READ(BBPD_CTRL),
+                   (unsigned)REG_READ(NRXPD_CTRL),
+                   (unsigned)REG_READ(FE_GEN_CTRL));
+#endif
+
+    /* Everything that must survive has been printed. If esp_intr_dump() hangs
+     * (newlib fprintf paths in ISR context are unknown), nothing below this
+     * marker is load-bearing - abort is terminal anyway. */
+    esp_rom_printf("TWDUMP-END\r\n");
+#if 1
+    esp_intr_dump(NULL);   /* allocated-interrupt table: handler names + CPU ints */
+#endif
 }
 
 #if CONFIG_ESP_TASK_WDT_EN
