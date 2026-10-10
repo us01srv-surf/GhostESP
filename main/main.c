@@ -10,6 +10,7 @@
 #include "core/system_manager.h"
 #include "core/ghostesp_version.h"
 #include "core/memory_debug.h"
+#include "core/twdt_diag.h"
 #include "managers/ap_manager.h"
 #include "managers/display_manager.h"
 #include "managers/ghostchi_manager.h"
@@ -950,6 +951,10 @@ void app_main(void) {
     MEASURE_INIT_RAM("BadBLE Manager", badble_manager_init());
 #endif
     esp_log_level_set("*", (esp_log_level_t)settings_get_log_level(&G_Settings));
+
+    /* TWDT instrumentation: run-time-stats sampler + log-hold tracker. Installed
+     * here, before ap_manager_init(), so boot and softAP bring-up are covered. */
+    twdt_diag_init();
 
 #if GHOSTESP_OTA_SUPPORTED
     MEASURE_INIT_RAM("OTA manager init", ota_manager_init());

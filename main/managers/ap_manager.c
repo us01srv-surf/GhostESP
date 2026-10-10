@@ -17,6 +17,7 @@
 #include <esp_http_server.h>
 #include <esp_log.h>
 #include <esp_netif.h>
+#include <esp_timer.h>
 #include <esp_wifi.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -2055,6 +2056,8 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
         }
         case IP_EVENT_AP_STAIPASSIGNED:
             glog("Assigned STA IP\n");
+            /* Correlate client association with any later TWDIAG starvation. */
+            ESP_LOGW("TWDIAG", "STA assoc t=%lldms", (long long)(esp_timer_get_time() / 1000));
             break;
         default:
             break;
