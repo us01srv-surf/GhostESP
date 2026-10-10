@@ -861,6 +861,18 @@ bool ap_manager_restore_after_attack(const char *who) {
     return false;
 }
 
+// Boot-mode policy: go APSTA only when STA credentials are actually saved.
+// With no credentials the STA interface never associates, but APSTA still
+// starts the wifi task's STA machinery (beacon/probe rx, scan state machine)
+// on an interface that will never be used -- keep the radio AP-only instead.
+static wifi_mode_t ap_manager_boot_wifi_mode(void) {
+    const char *sta_ssid = settings_get_sta_ssid(&G_Settings);
+    if (sta_ssid != NULL && sta_ssid[0] != '\0') {
+        return WIFI_MODE_APSTA;
+    }
+    return WIFI_MODE_AP;
+}
+
 esp_err_t ap_manager_init(void) {
     esp_err_t ret;
     wifi_mode_t mode;
@@ -934,7 +946,11 @@ esp_err_t ap_manager_init(void) {
         return ret;
     }
 
-    ret = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    wifi_mode_t boot_mode = ap_manager_boot_wifi_mode();
+    if (boot_mode == WIFI_MODE_AP) {
+        glog("AP-only boot: no saved WiFi credentials found\n");
+    }
+    ret = esp_wifi_set_mode(boot_mode);
     if (ret != ESP_OK) {
         glog("esp_wifi_set_mode failed: %s\n", esp_err_to_name(ret));
         return ret;
@@ -1111,8 +1127,12 @@ esp_err_t ap_manager_start_services() {
         return ESP_ERR_NOT_SUPPORTED;
     }
 
-    // Set Wi-Fi mode to AP
-    ret = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    // Set Wi-Fi mode to AP (APSTA only when STA credentials are saved)
+    wifi_mode_t svc_mode = ap_manager_boot_wifi_mode();
+    if (svc_mode == WIFI_MODE_AP) {
+        glog("AP-only services: no saved WiFi credentials found\n");
+    }
+    ret = esp_wifi_set_mode(svc_mode);
     if (ret != ESP_OK) {
         glog("WiFi mode set failed\n");
         return ret;

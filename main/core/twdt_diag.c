@@ -22,6 +22,11 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "esp_rom_sys.h"  /* esp_rom_printf: lock-free console write, safe in abort context */
+#include "esp_system.h"   /* esp_register_shutdown_handler */
+#if CONFIG_ESP_TASK_WDT_EN
+#include "esp_task_wdt.h" /* esp_task_wdt_isr_user_handler (weak; we override it) */
+#endif
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -101,8 +106,8 @@ static void td_install_log_tracker(void)
 #if defined(CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS)
 
 #define TD_MAX_TASKS   24
+#define TD_INIT_TASKS  32
 #define TD_PERIOD_US   500000
-#define TD_MIN_WALL_US 100000
 
 static esp_timer_handle_t s_timer;
 static TaskStatus_t s_prev[TD_MAX_TASKS];
@@ -111,6 +116,14 @@ static UBaseType_t s_prev_n;
 static int64_t s_prev_us;
 static bool s_have_prev;
 static uint32_t s_seq;
+
+/* Panic-dump baseline: snapshot taken in twdt_diag_init before the sampler
+ * starts. Static, never on a stack - the dump runs from abort context. */
+static TaskStatus_t s_init_prev[TD_INIT_TASKS];
+static UBaseType_t s_init_prev_n;
+static int64_t s_init_wall0;               /* 0 = baseline never taken */
+static volatile uint32_t s_cb_count;
+static volatile uint32_t s_last_cb_rel_ms;
 
 /* Delta of one current task against the previous snapshot. Modular
  * subtraction keeps this correct even if the counter type is 32-bit and
@@ -150,6 +163,21 @@ static void td_snapshot(const TaskStatus_t *cur, UBaseType_t n, int64_t now)
     s_have_prev = true;
 }
 
+/* Panic-dump baseline, taken in twdt_diag_init BEFORE the sampler starts. */
+static void td_take_baseline(void)
+{
+    UBaseType_t n = uxTaskGetSystemState(s_init_prev, TD_INIT_TASKS, NULL);
+    if (n > TD_INIT_TASKS) {
+        n = TD_INIT_TASKS;
+    }
+    s_init_prev_n = n;
+    s_init_wall0 = esp_timer_get_time();
+    s_cb_count = 0;
+    s_last_cb_rel_ms = 0;
+    /* Seed the rolling sampler from the same snapshot. */
+    td_snapshot(s_init_prev, n, s_init_wall0);
+}
+
 static void td_timer_cb(void *arg)
 {
     (void)arg;
@@ -160,6 +188,11 @@ static void td_timer_cb(void *arg)
         n = TD_MAX_TASKS;
     }
     const int64_t now = esp_timer_get_time();
+
+    s_cb_count++;
+    if (s_init_wall0 != 0) {
+        s_last_cb_rel_ms = (uint32_t)((now - s_init_wall0) / 1000);
+    }
 
     if (!s_have_prev) {
         /* Seed only - a first line would compare "everything since boot"
@@ -186,10 +219,6 @@ static void td_timer_cb(void *arg)
 
     td_snapshot(s_cur, n, now);
 
-    if (wall_us < TD_MIN_WALL_US) {
-        return;   /* callbacks fired back to back - not a usable interval */
-    }
-
     const uint64_t wall = (uint64_t)wall_us;
     /* Run-time counters accumulate across BOTH cores, so a single-core wall
      * under-estimates the budget; isr2~ uses 2*wall (dual core). */
@@ -198,7 +227,7 @@ static void td_timer_cb(void *arg)
     const uint64_t isr2 = (wall2 > sum) ? (wall2 - sum) : 0u;
 
     s_seq++;
-    ESP_LOGW(TD_TAG,
+    ESP_LOGE(TD_TAG,
              "wall=%llu sum=%llu idle=%llu wifi=%llu tcpip=%llu main=%llu mdns=%llu "
              "esp_timer=%llu isr~=%llu seq=%u idle1=%llu isr2~=%llu",
              (unsigned long long)wall, (unsigned long long)sum,
@@ -227,6 +256,112 @@ static void td_start_sampler(void)
     esp_timer_start_periodic(s_timer, TD_PERIOD_US);
 }
 
+/* ------------------------------------------------------------------ */
+/* Patch 4: TWDUMP - one-shot per-task dump against the init baseline. */
+/*                                                                      */
+/* Runs in abort context (TWDT ISR user handler / shutdown handler): no  */
+/* malloc, no stack buffers, and the primary output path is the ROM      */
+/* console (esp_rom_printf) because the ESP log mutex may be held by a   */
+/* preempted task during the abort - esp_log_write would wait 10ms       */
+/* (MAX_MUTEX_WAIT_MS, components/log/src/os/log_lock.c) and silently    */
+/* drop the line.                                                        */
+/* ------------------------------------------------------------------ */
+
+static bool s_dumped;   /* fire at most once (ISR handler + shutdown handler) */
+static TaskStatus_t s_dump[TD_INIT_TASKS];   /* fresh snapshot; static, abort context */
+
+static uint64_t td_dump_delta(const TaskStatus_t *cur)
+{
+    for (UBaseType_t i = 0; i < s_init_prev_n; i++) {
+        if (s_init_prev[i].xHandle == cur->xHandle) {
+            return (uint64_t)(cur->ulRunTimeCounter - s_init_prev[i].ulRunTimeCounter);
+        }
+    }
+    /* Task created after the baseline: its whole counter is delta. */
+    return (uint64_t)cur->ulRunTimeCounter;
+}
+
+static uint64_t td_dump_delta_by_name(const TaskStatus_t *cur, UBaseType_t n, const char *name)
+{
+    uint64_t acc = 0;
+    for (UBaseType_t i = 0; i < n; i++) {
+        if (cur[i].pcTaskName != NULL && strcmp(cur[i].pcTaskName, name) == 0) {
+            acc += td_dump_delta(&cur[i]);
+        }
+    }
+    return acc;
+}
+
+static void td_panic_dump(void)
+{
+    if (s_init_wall0 == 0 || s_dumped) {
+        return;   /* baseline never taken, or already dumped */
+    }
+    s_dumped = true;
+
+    UBaseType_t n = uxTaskGetSystemState(s_dump, TD_INIT_TASKS, NULL);
+    if (n > TD_INIT_TASKS) {
+        n = TD_INIT_TASKS;
+    }
+
+    const int64_t now = esp_timer_get_time();
+    const uint64_t wall_us =
+        (now > s_init_wall0) ? (uint64_t)(now - s_init_wall0) : 0u;
+
+    uint64_t sum = 0;
+    for (UBaseType_t i = 0; i < n; i++) {
+        sum += td_dump_delta(&s_dump[i]);
+    }
+
+    /* All values reported in milliseconds (run-time counters are us). */
+    const uint64_t wall = wall_us / 1000u;
+    const uint64_t sum_ms = sum / 1000u;
+    const uint64_t isr = (wall > sum_ms) ? (wall - sum_ms) : 0u;
+    const uint64_t wall2 = wall * 2u;
+    const uint64_t isr2 = (wall2 > sum_ms) ? (wall2 - sum_ms) : 0u;
+
+    static char s_line[320];   /* static: abort context, never stack */
+    snprintf(s_line, sizeof(s_line),
+             "TWDUMP seq=%u cbs=%u lastcb=%ums wall=%ums sum=%ums isr~=%ums isr2~=%ums "
+             "idle=%ums wifi=%ums tcpip=%ums main=%ums mdns=%ums tmr=%ums idle1=%ums "
+             "sys_evt=%ums bt=%ums",
+             (unsigned)s_seq, (unsigned)s_cb_count, (unsigned)s_last_cb_rel_ms,
+             (unsigned)wall, (unsigned)sum_ms, (unsigned)isr, (unsigned)isr2,
+             (unsigned)(td_dump_delta_by_name(s_dump, n, "IDLE") / 1000u),
+             (unsigned)(td_dump_delta_by_name(s_dump, n, "wifi") / 1000u),
+             (unsigned)(td_dump_delta_by_name(s_dump, n, "tcpip") / 1000u),
+             (unsigned)(td_dump_delta_by_name(s_dump, n, "main") / 1000u),
+             (unsigned)(td_dump_delta_by_name(s_dump, n, "mdns") / 1000u),
+             (unsigned)(td_dump_delta_by_name(s_dump, n, "esp_timer") / 1000u),
+             (unsigned)(td_dump_delta_by_name(s_dump, n, "IDLE1") / 1000u),
+             (unsigned)(td_dump_delta_by_name(s_dump, n, "sys_evt") / 1000u),
+             (unsigned)(td_dump_delta_by_name(s_dump, n, "bt") / 1000u));
+
+    /* Panic-safe path first: ROM console, no lock, no malloc. */
+    esp_rom_printf("%s\r\n", s_line);
+    /* Belt-and-braces: also via the logger (may be dropped if its mutex is
+     * held by the task the watchdog is aborting - that is fine). */
+    esp_log_write(ESP_LOG_ERROR, "TWDIAG", "%s\r\n", s_line);
+}
+
+#if CONFIG_ESP_TASK_WDT_EN
+/* Weak symbol from esp_task_wdt.h; the TWDT timeout ISR calls this right
+ * before it aborts. On the v6.1 panic path (task_wdt_isr ->
+ * xt_unhandled_exception -> esp_panic_handler -> panic_restart ->
+ * esp_restart_noos) shutdown handlers never run, so this ISR hook is what
+ * actually delivers the TWDUMP on a TWDT abort; the shutdown handler covers
+ * esp_restart() paths (OTA reboot etc.). */
+void esp_task_wdt_isr_user_handler(void)
+{
+    td_panic_dump();
+}
+#endif
+
+static void td_register_panic_hooks(void)
+{
+    esp_register_shutdown_handler(td_panic_dump);
+}
+
 #else /* !CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS */
 
 static void td_start_sampler(void)
@@ -236,6 +371,9 @@ static void td_start_sampler(void)
     ESP_LOGD(TD_TAG, "run-time stats off: sampler disabled (enable "
                      "CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS)");
 }
+
+static void td_register_panic_hooks(void) { /* no run-time counters to dump */ }
+static void td_take_baseline(void) { /* no run-time counters to baseline */ }
 
 #endif /* CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS */
 
@@ -250,6 +388,9 @@ void twdt_diag_init(void)
     td_install_log_tracker();
     /* Pinned after the app's wildcard level so a user setting of ERROR cannot
      * silence the instrumentation. */
-    esp_log_level_set(TD_TAG, ESP_LOG_WARN);
+    esp_log_level_set(TD_TAG, ESP_LOG_ERROR);
+    /* Baseline BEFORE the sampler timer starts: TWDUMP diffs against this. */
+    td_take_baseline();
+    td_register_panic_hooks();
     td_start_sampler();
 }
