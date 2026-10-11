@@ -413,12 +413,15 @@ static void td_panic_dump(void)
              top_name[1], (unsigned)top_ms[1],
              top_name[2], (unsigned)top_ms[2]);
 
-    /* Panic-safe path first: ROM console, no lock, no malloc. */
+    /* ROM console only from here: no locks, no malloc. Flash validation of
+     * diag6 showed every line printed AFTER the old esp_log_write() call was
+     * missing from serial (TWDUMP-END absent, IEN/IPEND/IST/WRF lost) - the
+     * log mutex + newlib in TWDT ISR context wedges the abort path and the
+     * panic reentrancy guard restarts with suppressed output. The logger
+     * belt-and-braces call was therefore REMOVED; rom_printf is the only
+     * output path allowed in this function. */
     esp_rom_printf("%s\r\n", s_line);
-    /* Belt-and-braces: also via the logger (may be dropped if its mutex is
-     * held by the task the watchdog is aborting - that is fine). */
-    esp_log_write(ESP_LOG_ERROR, "TWDIAG", "%s\r\n", s_line);
-
+    esp_rom_printf("STAGE1\r\n");
 #if CONFIG_IDF_TARGET_ESP32S3
     /* Interrupt-controller + WiFi-domain registers: which CPU interrupt is
      * pending/stuck and which peripheral sources are asserting. */
@@ -430,13 +433,13 @@ static void td_panic_dump(void)
                    (unsigned)REG_READ(NRXPD_CTRL),
                    (unsigned)REG_READ(FE_GEN_CTRL));
 #endif
-
-    /* Everything that must survive has been printed. If esp_intr_dump() hangs
-     * (newlib fprintf paths in ISR context are unknown), nothing below this
-     * marker is load-bearing - abort is terminal anyway. */
     esp_rom_printf("TWDUMP-END\r\n");
-#if 1
-    esp_intr_dump(NULL);   /* allocated-interrupt table: handler names + CPU ints */
+#if 0
+    /* Disabled (diag6 evidence): esp_intr_dump() uses newlib FILE streams /
+     * fprintf - in TWDT ISR context it wedges the abort path; everything
+     * after the old esp_log_write/log call produced no serial output.
+     * Re-enable only if a lock-free dump path ever exists. */
+    esp_intr_dump(NULL);
 #endif
 }
 
