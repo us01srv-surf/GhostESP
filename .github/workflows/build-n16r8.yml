@@ -30,7 +30,7 @@ jobs:
           path: |
             ~/esp-idf
             ~/.espressif
-          key: esp-idf-v6.1-${{ runner.os }}-v1
+          key: esp-idf-v6.1-rel61-${{ runner.os }}-v1
 
       - name: Install ESP-IDF Dependencies
         if: steps.cache-idf.outputs.cache-hit != 'true'
@@ -41,7 +41,7 @@ jobs:
       - name: Install ESP-IDF
         if: steps.cache-idf.outputs.cache-hit != 'true'
         run: |
-          git clone -b v6.1 --depth 1 --recursive https://github.com/espressif/esp-idf.git ~/esp-idf
+          git clone -b release/v6.1 --depth 1 --recursive https://github.com/espressif/esp-idf.git ~/esp-idf
           ~/esp-idf/install.sh
 
       - name: Repair cached ESP-IDF Python environment if broken
