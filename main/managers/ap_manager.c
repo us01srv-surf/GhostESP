@@ -49,6 +49,10 @@ static const char *TAG = "ap_manager";
 #include "managers/camera_stream_manager.h"
 #endif
 
+/* diag11 experiment: skip softAP start to test whether AP start triggers the
+ * ISR storm (expect: stable boot + ghost> prompt). */
+#define DIAG11_SKIP_AP_START 1
+
 #ifndef IN6_IS_ADDR_V4MAPPED
 #define IN6_IS_ADDR_V4MAPPED(a)                                             \
     (((const uint8_t *)(a))[0] == 0 && ((const uint8_t *)(a))[1] == 0 &&    \
@@ -946,6 +950,16 @@ esp_err_t ap_manager_init(void) {
         return ret;
     }
 
+#if DIAG11_SKIP_AP_START
+    /* diag11: return here, AFTER esp_wifi_init + default AP netif creation
+     * (done above) but BEFORE set_mode / apply_profile / set_config /
+     * DHCP / esp_wifi_start. The driver stays initialized and usable for a
+     * later manual start, but at boot there is no mode set, no config, no
+     * beacons and no wifi TX at all. */
+    glog("diag11: boot softAP start skipped (DIAG11_SKIP_AP_START=1); wifi driver initialized but NOT started\n");
+    return ESP_OK;
+#else
+
     wifi_mode_t boot_mode = ap_manager_boot_wifi_mode();
     if (boot_mode == WIFI_MODE_AP) {
         glog("AP-only boot: no saved WiFi credentials found\n");
@@ -1067,6 +1081,8 @@ esp_err_t ap_manager_init(void) {
     } else {
         glog("Failed to get IP address\n");
     }
+
+#endif /* DIAG11_SKIP_AP_START */
 
     return ESP_OK;
 }
