@@ -975,7 +975,10 @@ esp_err_t ap_manager_init(void) {
     wifi_config_t wifi_config = {
         .ap =
             {
-                .channel = 6,
+                // diag10 experiment: pin AP to channel 11 to escape 2.4GHz
+                // congestion (host scans show neighbors on ch 3/4/6; the
+                // WMAC/WBB ISR storm starts right after AP beaconing).
+                .channel = 11,
                 .max_connection = 4,
 #if defined(CONFIG_IDF_TARGET_ESP32C5) || defined(CONFIG_IDF_TARGET_ESP32C6)
                 .authmode = WIFI_AUTH_WPA2_WPA3_PSK,
